@@ -1,0 +1,183 @@
+import streamlit as st
+from datetime import datetime
+from opensearchpy import OpenSearch
+import json
+
+# Initialize OpenSearch client (update with your cluster details)
+client = OpenSearch(
+    hosts=[{'host': 'localhost', 'port': 9200}],
+    http_auth=('admin', 'admin'),
+    use_ssl=True,
+    verify_certs=False
+)
+
+# Streamlit page configuration
+st.set_page_config(page_title="Dynamic Search Application", layout="wide")
+
+def generate_opensearch_query(inputs, operators):
+    """Generate a dynamic OpenSearch query based on inputs and operators."""
+    query = {"query": {"bool": {}}}
+
+    # Initialize bool query clauses
+    filter_clauses = []  # For exact matches and ranges
+    should_clauses = []  # For OR conditions
+    must_clauses = []   # For AND conditions
+
+    # Process date range (combined as one condition)
+    if inputs["from_date"] and inputs["to_date"]:
+        date_query = {
+            "range": {
+                "creation_date": {
+                    "gte": inputs["from_date"].strftime("%Y-%m-%d"),
+                    "lte": inputs["to_date"].strftime("%Y-%m-%d")
+                }
+            }
+        }
+        filter_clauses.append(date_query)
+
+    # Process created_by
+    if inputs["created_by"]:
+        created_by_query = {"term": {"created_by.keyword": inputs["created_by"]}}
+        filter_clauses.append(created_by_query)
+
+    # Process autoname
+    if inputs["autoname"]:
+        autoname_query = {"term": {"autoname.keyword": inputs["autoname"]}}
+        filter_clauses.append(autoname_query)
+
+    # Process title
+    if inputs["title"]:
+        title_query = {"match": {"title": inputs["title"]}}
+        filter_clauses.append(title_query)
+
+    # If no inputs, return empty query
+    if not filter_clauses:
+        return {"query": {"match_all": {}}}
+
+    # Build query based on operators
+    # Operators: [op1 (between dates and created_by), op2 (between created_by and autoname), op3 (between autoname and title)]
+    # Strategy: Group conditions dynamically based on operator precedence
+    current_clause = filter_clauses[0] if filter_clauses else None
+    query_stack = [current_clause]
+
+    for i, op in enumerate(operators):
+        if i + 1 >= len(filter_clauses):
+            break  # No more conditions to process
+
+        next_clause = filter_clauses[i + 1]
+        if op == "AND":
+            if query_stack[-1] is not None:
+                must_clauses.append(query_stack[-1])
+            query_stack[-1] = next_clause
+        else:  # OR
+            if query_stack[-1] is not None:
+                should_clauses.append(query_stack[-1])
+            query_stack[-1] = next_clause
+
+    # Append the last clause
+    if query_stack[-1] is not None:
+        if operators and operators[-1] == "OR":
+            should_clauses.append(query_stack[-1])
+        else:
+            must_clauses.append(query_stack[-1])
+
+    # Construct final bool query
+    if should_clauses:
+        query["query"]["bool"]["should"] = should_clauses
+        query["query"]["bool"]["minimum_should_match"] = 1
+    if must_clauses:
+        query["query"]["bool"]["must"] = must_clauses
+    if filter_clauses and not (should_clauses or must_clauses):
+        query["query"]["bool"]["filter"] = filter_clauses
+
+    return query
+
+def main():
+    st.title("Dynamic Search Application")
+
+    # Create a form for organized input
+    with st.form("search_form"):
+        # First row: Date fields
+        col1, col2, col3 = st.columns([3, 1, 3])
+        with col1:
+            from_date = st.date_input("From Creation Date", value=None)
+        with col2:
+            st.write("")  # Spacer
+            operator1 = st.selectbox("Operator 1", ["AND", "OR"], key="op1")
+        with col3:
+            to_date = st.date_input("To Creation Date", value=None)
+
+        # Second row: Created By and Autoname
+        col1, col2, col3 = st.columns([3, 1, 3])
+        with col1:
+            created_by = st.text_input("Created By", placeholder="e.g., john")
+        with col2:
+            operator2 = st.selectbox("Operator 2", ["AND", "OR"], key="op2")
+        with col3:
+            autoname = st.text_input("Autoname", placeholder="e.g., RX12345")
+
+        # Third row: Title
+        col1, col2, col3 = st.columns([3, 1, 3])
+        with col1:
+            title = st.text_input("Title", placeholder="e.g., test notebook")
+        with col2:
+            operator3 = st.selectbox("Operator 3", ["AND", "OR"], key="op3")
+        with col3:
+            st.write("")  # Empty column for alignment
+
+        # Submit button
+        submit_button = st.form_submit_button("Search")
+
+    # Process search when form is submitted
+    if submit_button:
+        # Validate input
+        if not any([from_date, to_date, created_by, autoname, title]):
+            st.warning("Please fill at least one field to search.")
+            return
+
+        # Validate date range
+        if (from_date and not to_date) or (to_date and not from_date):
+            st.warning("Please provide both From and To dates for date range search.")
+            return
+
+        # Prepare inputs
+        inputs = {
+            "from_date": from_date,
+            "to_date": to_date,
+            "created_by": created_by,
+            "autoname": autoname,
+            "title": title
+        }
+        operators = [operator1, operator2, operator3]
+
+        # Generate OpenSearch query
+        query = generate_opensearch_query(inputs, operators)
+
+        # Display the generated query
+        st.subheader("Generated OpenSearch Query")
+        st.json(query)
+
+        try:
+            # Execute search (replace 'your_index' with your index name)
+            response = client.search(
+                index="your_index",
+                body=query
+            )
+
+            # Display results
+            st.subheader("Search Results")
+            hits = response["hits"]["hits"]
+
+            if not hits:
+                st.info("No results found.")
+                return
+
+            for hit in hits:
+                with st.expander(f"Result ID: {hit['_id']}"):
+                    st.json(hit["_source"])
+
+        except Exception as e:
+            st.error(f"Error executing search: {str(e)}")
+
+if __name__ == "__main__":
+    main()
